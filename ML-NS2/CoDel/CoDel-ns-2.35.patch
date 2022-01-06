@@ -1,0 +1,810 @@
+diff -ru --unidirectional-new-file ns-allinone-2.35/ns-2.35/Makefile.in ns-allinone-2.35-patched/ns-2.35/Makefile.in
+--- ns-allinone-2.35/ns-2.35/Makefile.in	2011-10-23 09:29:54.000000000 -0700
++++ ns-allinone-2.35-patched/ns-2.35/Makefile.in	2012-05-07 07:46:30.000000000 -0700
+@@ -217,7 +217,7 @@
+ 	tools/integrator.o tools/queue-monitor.o \
+ 	tools/flowmon.o tools/loss-monitor.o \
+ 	queue/queue.o queue/drop-tail.o \
+-	adc/simple-intserv-sched.o queue/red.o \
++	adc/simple-intserv-sched.o queue/red.o queue/codel.o \
+ 	queue/semantic-packetqueue.o queue/semantic-red.o \
+ 	tcp/ack-recons.o \
+ 	queue/sfq.o queue/fq.o queue/drr.o queue/srr.o queue/cbq.o \
+diff -ru --unidirectional-new-file ns-allinone-2.35/ns-2.35/codel.tcl ns-allinone-2.35-patched/ns-2.35/codel.tcl
+--- ns-allinone-2.35/ns-2.35/codel.tcl	1969-12-31 16:00:00.000000000 -0800
++++ ns-allinone-2.35-patched/ns-2.35/codel.tcl	2012-05-13 22:02:39.000000000 -0700
+@@ -0,0 +1,433 @@
++# Codel test script v120513
++
++# Run this to run CoDel AQM tests.
++# ns codel.tcl f w c {b}Mb s d r
++# where:
++#	f = # ftps
++#	w = # PackMime connections per second
++#	c = # CBRs
++#	b = bottleneck bandwidth in Mbps
++#	s = filesize for ftp, -1 for infinite
++#	d = dynamic bandwidth, if non-zero, changes (kind of kludgey)
++#		have to set the specific change ratios in this file (below)
++#	r = number of "reverse" ftps
++
++set stopTime 300
++set ns [new Simulator]
++
++# These are defaults if values not set on command line
++
++set num_ftps 1
++set web_rate 0
++set revftp 0
++set num_cbrs 0
++#rate and packetSize set in build_cbr
++set bottleneck 3Mb
++#for a 10MB ftp
++set filesize 10000000
++set dynamic_bw 0
++set greedy 0
++
++# Parse command line
++
++if {$argc >= 1} {
++    set num_ftps [lindex $argv 0]
++    if {$argc >= 2} {
++        set web_rate [lindex $argv 1]
++        if {$argc >= 3} {
++            set num_cbrs [lindex $argv 2]
++            if {$argc >= 4} {
++            	set bottleneck [lindex $argv 3]
++	    	if {$argc >= 5} {
++			set filesize [lindex $argv 4]
++	   	 	if {$argc >= 6} {
++				set dynamic_bw [lindex $argv 5]
++	   	 		if {$argc >= 7} {
++					set revftp [lindex $argv 6]
++	    			}
++	    		}
++        	}
++    	     }
++	}
++    }
++}
++
++set bw [bw_parse $bottleneck]
++if { $revftp >= 1} {
++	set num_revs $revftp
++} else {
++	set num_revs 0
++}
++puts "ftps $num_ftps webrate $web_rate cbrs $num_cbrs bw $bw filesize $filesize reverse $num_revs"
++
++# experiment settings
++set psize 1500
++if { $bw < 1000000} { set psize 500 }
++set nominal_rtt [delay_parse 100ms]
++set accessdly 20
++set bdelay 10 
++set realrtt [expr 2*(2*$accessdly + $bdelay)]
++puts "accessdly $accessdly bneckdly $bdelay realrtt $realrtt bneckbw $bw"
++
++# CoDel values
++# interval to keep min over
++set interval [delay_parse 100ms]
++# target in ms.
++set target [delay_parse 5ms]
++
++global defaultRNG
++$defaultRNG seed 0
++ns-random 0
++#$defaultRNG seed 54321
++#ns-random 23145
++
++# ------- config info is all above this line ----------
++
++#bdp in packets, based on the nominal rtt
++set bdp [expr round($bw*$nominal_rtt/(8*$psize))]
++
++Trace set show_tcphdr_ 1
++set startTime 0.0
++
++#TCP parameters - have to set both for FTPs and PackMime
++
++Agent/TCP set window_ [expr $bdp*16]
++Agent/TCP set segsize_ [expr $psize-40]
++Agent/TCP set packetSize_ [expr $psize-40]
++Agent/TCP set windowInit_ 4
++Agent/TCP set segsperack_ 1
++Agent/TCP set timestamps_ true
++set delack 0.4
++Agent/TCP set interval_ $delack
++
++Agent/TCP/FullTcp set window_ [expr $bdp*16]
++Agent/TCP/FullTcp set segsize_ [expr $psize-40]
++Agent/TCP/FullTcp set packetSize_ [expr $psize-40]
++Agent/TCP/FullTcp set windowInit_ 4
++Agent/TCP/FullTcp set segsperack_ 1
++Agent/TCP/FullTcp set timestamps_ true
++Agent/TCP/FullTcp set interval_ $delack
++
++
++Agent/TCP/Linux instproc done {} {
++	global ns filesize
++#this doesn't seem to work, had to hack tcp-linux.cc to do repeat ftps
++	$self set closed_ 0
++#needs to be delayed by at least .3sec to slow start
++	puts "[$ns now] TCP/Linux proc done called"
++	$ns at [expr [$ns now] + 0.3] "$self send $filesize"
++}
++
++# problem is that idle() in tcp.cc never seems to get called...
++Application/FTP instproc resume {} {
++puts "called resume"
++        global filesize
++        $self send $filesize
++#	$ns at [expr [$ns now] + 0.5] "[$self agent] reset"
++	$ns at [expr [$ns now] + 0.5] "[$self agent] send $filesize"
++}
++
++Application/FTP instproc fire {} {
++        global filesize
++        $self instvar maxpkts_
++        set maxpkts_ $filesize
++	[$self agent] set maxpkts_ $filesize
++        $self send $maxpkts_
++	puts "fire() FTP"
++}
++
++#buffersizes
++set buffersize [expr $bdp]
++set buffersize1 [expr $bdp*10]
++
++Queue/CoDel set target_ $target
++Queue/CoDel set interval_ $interval
++
++#set Flow_id 1
++
++proc build_topology { ns which } {
++    # nodes n0 and n1 are the server and client side gateways and
++    # the link between them is the congested slow link. n0 -> n1
++    # handles all the server to client traffic.
++    #
++    # if the web_rate is non-zero, node n2 will be the packmime server cloud
++    # and node n3 will be the client cloud.
++    #
++    # num_ftps server nodes and client nodes are created for the ftp sessions.
++    # the first client node is n{2+w} and the first server node is n{2+f+w}
++    # where 'f' is num_ftps and 'w' is 1 if web_rate>0 and 0 otherwise.
++    # servers will be even numbered nodes, clients odd
++    # Warning: the numbering here is ridiculously complicated
++
++    global bw bdelay accessdly buffersize buffersize1 filesize node_cnt
++    set node_cnt 2
++
++    # congested link
++    global n0 n1
++    set n0 [$ns node]
++    set n1 [$ns node]
++    $ns duplex-link $n0 $n1 $bw ${bdelay}ms CoDel
++    $ns duplex-link-op $n0 $n1 orient right
++    $ns duplex-link-op $n0 $n1 queuePos 0.5
++    $ns duplex-link-op $n1 $n0 queuePos 1.5
++    $ns queue-limit $n0 $n1 $buffersize
++    $ns queue-limit $n1 $n0 $buffersize
++    set node_cnt 2
++
++    #dynamic bandwidth
++    # these are the multipliers for changing bw, times initial set bw
++    # edit these values to get different patterns
++    global stopTime dynamic_bw
++    array names bw_changes
++    set bw_changes(1) 0.1
++    set bw_changes(2) 0.01
++    set bw_changes(3) 0.5
++    set bw_changes(4) 0.01
++    set bw_changes(5) 1.0
++
++    puts "bottleneck starts at [[[$ns link $n0 $n1] link] set bandwidth_]bps"
++    for {set k 1} {$k <= $dynamic_bw} {incr k 1} {
++	set changeTime [expr $k*$stopTime/($dynamic_bw+1)]
++	set f $bw_changes($k)
++	set newBW [expr $f*$bw]
++	puts "change at $changeTime to [expr $newBW/1000000.]Mbps"
++	$ns at $changeTime "[[$ns link $n0 $n1] link] set bandwidth_ $newBW"
++	$ns at $changeTime "[[$ns link $n1 $n0] link] set bandwidth_ $newBW"
++	$ns at $changeTime "puts $newBW"
++    }
++
++    set li_10 [[$ns link $n1 $n0] queue]
++    set li_01 [[$ns link $n0 $n1] queue]
++
++    set tchan_ [open /tmp/redqvar.tr w]
++    $li_01 trace curq_
++    $li_01 trace d_exp_
++    $li_01 attach $tchan_
++
++    global num_ftps web_rate num_cbrs greedy num_revs
++    set linkbw [expr $bw*10]
++
++    set w [expr $web_rate > 0]
++    if {$w} {
++        global n2 n3
++	#server
++        set n2 [$ns node]
++        $ns duplex-link $n2 $n0 $linkbw ${accessdly}ms DropTail
++        $ns queue-limit $n2 $n0 $buffersize1
++        $ns queue-limit $n0 $n2 $buffersize1
++
++	#client
++        set n3 [$ns node]
++        $ns duplex-link $n1 $n3 $linkbw ${accessdly}ms DropTail
++        $ns queue-limit $n1 $n3 $buffersize1
++        $ns queue-limit $n3 $n1 $buffersize1
++	set node_cnt 4
++    }
++#need to fix the angles if use nam
++    for {set k 0} {$k < $num_ftps} {incr k 1} {
++        # servers
++        set j $node_cnt
++        global n$j
++        set n$j [$ns node]
++	if {$greedy > 0 && $k == 0} {
++         $ns duplex-link [set n$j] $n0 $linkbw 1ms DropTail
++	} else {
++         $ns duplex-link [set n$j] $n0 $linkbw ${accessdly}ms DropTail
++	}
++        $ns queue-limit [set n$j] $n0 $buffersize1
++        $ns queue-limit $n0 [set n$j] $buffersize1
++        set angle [expr $num_ftps>1? 0.75+($k-1)*.5/($num_ftps-1) : 1]
++        $ns duplex-link-op $n0 [set n$j] orient $angle
++	incr node_cnt
++
++        # clients
++        set j $node_cnt
++        global n$j
++        set n$j [$ns node]
++        set dly [expr ${accessdly} +($k+1)]
++        $ns duplex-link $n1 [set n$j] $linkbw  ${dly}ms  DropTail
++        $ns queue-limit $n1 [set n$j] $buffersize1
++        $ns queue-limit [set n$j] $n1 $buffersize1
++        set angle [expr $num_ftps>1? fmod(2.25-($k-1)*.5/($num_ftps-1), 2) : 0]
++        $ns duplex-link-op $n1 [set n$j] orient $angle
++	incr node_cnt
++    }
++    for {set k 0} {$k < $num_cbrs} {incr k 1} {
++        # servers
++        set j $node_cnt
++        global n$j
++        set n$j [$ns node]
++        $ns duplex-link [set n$j] $n0 $linkbw ${accessdly}ms DropTail
++        $ns queue-limit [set n$j] $n0 $buffersize1
++        $ns queue-limit $n0 [set n$j] $buffersize1
++#        set angle [expr $num_cbrs>1? 0.75+($k-1)*.5/($num_cbrs-1) : 1]
++        $ns duplex-link-op $n0 [set n$j] orient $angle
++	incr node_cnt
++
++        # clients
++        set j $node_cnt
++        global n$j
++        set n$j [$ns node]
++        $ns duplex-link $n1 [set n$j] $linkbw  ${accessdly}ms  DropTail
++        $ns queue-limit $n1 [set n$j] $buffersize1
++        $ns queue-limit [set n$j] $n1 $buffersize1
++#        set angle [expr $num_cbrs>1? fmod(2.25-($k-1)*.5/($num_ftps-1), 2) : 0]
++        $ns duplex-link-op $n1 [set n$j] orient $angle
++	incr node_cnt
++    }
++#reverse direction ftps
++    for {set k 0} {$k < $num_revs} {incr k 1} {
++        # clients
++        set j $node_cnt
++        global n$j
++        set n$j [$ns node]
++        $ns duplex-link [set n$j] $n0 $linkbw ${accessdly}ms DropTail
++        $ns queue-limit [set n$j] $n0 $buffersize1
++        $ns queue-limit $n0 [set n$j] $buffersize1
++        set angle [expr $num_ftps>1? 0.75+($k-1)*.5/($num_ftps-1) : 1]
++        $ns duplex-link-op $n0 [set n$j] orient $angle
++	incr node_cnt
++
++        # servers
++        set j $node_cnt
++        global n$j
++        set n$j [$ns node]
++        set dly [expr ($accessdly)*1.1 +($k+1)]
++        $ns duplex-link $n1 [set n$j] $linkbw  ${dly}ms  DropTail
++        $ns queue-limit $n1 [set n$j] $buffersize1
++        $ns queue-limit [set n$j] $n1 $buffersize1
++        set angle [expr $num_ftps>1? fmod(2.25-($k-1)*.5/($num_ftps-1), 2) : 0]
++        $ns duplex-link-op $n1 [set n$j] orient $angle
++	incr node_cnt
++    }
++}
++
++proc build_cbr {cnd snd startTime timeToStop Flow_id} {
++    global ns
++    set udp [$ns create-connection UDP $snd LossMonitor $cnd $Flow_id]
++    set cbr [new Application/Traffic/CBR]
++    $cbr attach-agent $udp
++    # change these for different types of CBRs
++    $cbr set packetSize_ 100
++    $cbr set rate_ 0.064Mb
++    $ns at $startTime "$cbr start"
++    $ns at $timeToStop "$cbr stop"
++}
++
++# cnd is client node, snd is server node
++proc build_ftpclient {cnd snd startTime timeToStop Flow_id} {
++    
++    global ns filesize greedy revftp
++    set ctcp [$ns create-connection TCP/Linux $snd TCPSink/Sack1 $cnd $Flow_id]
++    $ctcp select_ca cubic
++    set ftp [$ctcp attach-app FTP]
++    $ftp set enableResume_ true
++    $ftp set type_ FTP 
++
++#set up a single infinite ftp with smallest RTT
++    if {$greedy > 0 || $filesize < 0} {
++     $ns at $startTime "$ftp start"
++     set greedy 0
++    } else {
++     $ns at $startTime "$ftp send $filesize"
++    }
++    $ns at $timeToStop "$ftp stop"
++}
++
++proc build_webs {cnd snd rate startTime timeToStop} {
++    set CLIENT 0
++    set SERVER 1
++
++    # SETUP PACKMIME
++    set pm [new PackMimeHTTP]
++    $pm set-TCP Sack
++    $pm set-client $cnd
++    $pm set-server $snd
++    $pm set-rate $rate;                    # new connections per second
++    $pm set-http-1.1;                      # use HTTP/1.1
++
++    # create RandomVariables
++    set flow_arrive [new RandomVariable/PackMimeHTTPFlowArrive $rate]
++    set req_size [new RandomVariable/PackMimeHTTPFileSize $rate $CLIENT]
++    set rsp_size [new RandomVariable/PackMimeHTTPFileSize $rate $SERVER]
++
++    # assign RNGs to RandomVariables
++    $flow_arrive use-rng [new RNG]
++    $req_size use-rng [new RNG]
++    $rsp_size use-rng [new RNG]
++
++    # set PackMime variables
++    $pm set-flow_arrive $flow_arrive
++    $pm set-req_size $req_size
++    $pm set-rsp_size $rsp_size
++
++    global ns
++    $ns at $startTime "$pm start"
++    $ns at $timeToStop "$pm stop"
++}
++
++proc uniform {a b} {
++	expr $a + (($b- $a) * ([ns-random]*1.0/0x7fffffff))
++}
++
++proc finish {} {
++        global ns
++	$ns halt
++        $ns flush-trace
++        exit 0
++}
++
++# $ns namtrace-all [open out.nam w]
++# $ns color 2 blue
++# $ns color 3 red
++# $ns color 4 yellow
++# $ns color 5 green
++
++build_topology $ns CoDel
++
++#$ns trace-queue $n0 $n1 [open out_n0ton1.tr w]
++#set fname f${num_ftps}w${web_rate}b${bottleneck}.tr
++set fname f.tr
++puts $fname
++$ns trace-queue $n0 $n1 [open /tmp/$fname w]
++#reverse direction
++#$ns trace-queue $n1 $n0 [open /tmp/$fname w]
++
++set node_cnt 2
++if {$web_rate > 0} {
++        build_webs $n3 $n2 $web_rate 0 $stopTime
++	set node_cnt 4
++}
++
++for {set k 1} {$k <= $num_ftps} {incr k 1} {
++    set j $node_cnt
++    incr node_cnt
++    set i $node_cnt
++    build_ftpclient [set n$i] [set n$j]  \
++ 		$startTime $stopTime $i
++# 		[expr 1.0*($k-1)] $stopTime $i
++# 		[expr $startTime+($k-1)*[uniform 0.0 2.0]] $stopTime $i
++    incr node_cnt
++}
++
++for {set k 1} {$k <= $num_cbrs} {incr k 1} {
++    set j $node_cnt
++    incr node_cnt
++    set i $node_cnt
++    build_cbr [set n$i] [set n$j]  \
++ 		[expr $startTime+($k-1)*[uniform 0.0 2.0]] $stopTime $i
++    incr node_cnt
++}
++
++#for reverse direction, give client smaller number
++for {set k 1} {$k <= $num_revs} {incr k 1} {
++    set j $node_cnt
++    incr node_cnt
++    set i $node_cnt
++    build_ftpclient [set n$j] [set n$i] $startTime $stopTime $j
++    incr node_cnt
++}
++
++$ns at [expr $stopTime ] "finish"
++$ns run
++exit 0
+diff -ru --unidirectional-new-file ns-allinone-2.35/ns-2.35/queue/codel.cc ns-allinone-2.35-patched/ns-2.35/queue/codel.cc
+--- ns-allinone-2.35/ns-2.35/queue/codel.cc	1969-12-31 16:00:00.000000000 -0800
++++ ns-allinone-2.35-patched/ns-2.35/queue/codel.cc	2012-05-13 22:02:23.000000000 -0700
+@@ -0,0 +1,254 @@
++/*
++ * Codel - The Controlled-Delay Active Queue Management algorithm
++ * Copyright (C) 2011-2012 Kathleen Nichols <nichols@pollere.com>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions, and the following disclaimer,
++ *    without modification.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The names of the authors may not be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * Alternatively, provided that this notice is retained in full, this
++ * software may be distributed under the terms of the GNU General
++ * Public License ("GPL") version 2, in which case the provisions of the
++ * GPL apply INSTEAD OF those given above.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <math.h>
++#include <sys/types.h>
++#include "config.h"
++#include "template.h"
++#include "random.h"
++#include "flags.h"
++#include "delay.h"
++#include "codel.h"
++
++static class CoDelClass : public TclClass {
++  public:
++    CoDelClass() : TclClass("Queue/CoDel") {}
++    TclObject* create(int, const char*const*) {
++        return (new CoDelQueue);
++    }
++} class_codel;
++
++CoDelQueue::CoDelQueue() : tchan_(0)
++{
++    bind("interval_", &interval_);
++    bind("target_", &target_);  // target min delay in clock ticks
++    bind("curq_", &curq_);      // current queue size in bytes
++    bind("d_exp_", &d_exp_);    // current delay experienced in clock ticks
++    q_ = new PacketQueue();     // underlying queue
++    pq_ = q_;
++    reset();
++}
++
++void CoDelQueue::reset()
++{
++    curq_ = 0;
++    d_exp_ = 0.;
++    dropping_ = 0;
++    first_above_time_ = -1;
++    maxpacket_ = 256;
++    count_ = 0;
++    Queue::reset();
++}
++
++// Add a new packet to the queue.  The packet is dropped if the maximum queue
++// size in pkts is exceeded. Otherwise just add a timestamp so dequeue can
++// compute the sojourn time (all the work is done in the deque).
++
++void CoDelQueue::enque(Packet* pkt)
++{
++    if(q_->length() >= qlim_) {
++        // tail drop
++        drop(pkt);
++    } else {
++        HDR_CMN(pkt)->ts_ = Scheduler::instance().clock();
++        q_->enque(pkt);
++    } 
++}
++
++// return the time of the next drop relative to 't'
++double CoDelQueue::control_law(double t)
++{
++    return t + interval_ / sqrt(count_);
++}
++
++// Internal routine to dequeue a packet. All the delay and min tracking
++// is done here to make sure it's done consistently on every dequeue.
++dodequeResult CoDelQueue::dodeque()
++{
++    double now = Scheduler::instance().clock();
++    dodequeResult r = { NULL, 0 };
++
++    r.p = q_->deque();
++    if (r.p == NULL) {
++        curq_ = 0;
++        first_above_time_ = 0;
++    } else {
++        // d_exp_ and curq_ are ns2 'traced variables' that allow the dynamic
++        // queue behavior that drives CoDel to be captured in a trace file for
++        // diagnostics and analysis.  d_exp_ is the sojourn time and curq_ is
++        // the current q size in bytes.
++        d_exp_ = now - HDR_CMN(r.p)->ts_;
++        curq_ = q_->byteLength();
++
++        if (maxpacket_ < HDR_CMN(r.p)->size_)
++            // keep track of the max packet size.
++            maxpacket_ = HDR_CMN(r.p)->size_;
++
++        // To span a large range of bandwidths, CoDel essentially runs two
++        // different AQMs in parallel. One is sojourn-time-based and takes
++        // effect when target_ is larger than the time it takes to send a
++        // TCP MSS packet. The 1st term of the "if" does this.
++        // The other is backlog-based and takes effect when the time to send an
++        // MSS packet is >= target_. The goal here is to keep the output link
++        // utilization high by never allowing the queue to get smaller than
++        // the amount that arrives in a typical interarrival time (one MSS-sized
++        // packet arriving spaced by the amount of time it takes to send such
++        // a packet on the bottleneck). The 2nd term of the "if" does this.
++        if (d_exp_ < target_ || curq_ <= maxpacket_) {
++            // went below - stay below for at least interval
++            first_above_time_ = 0;
++        } else {
++            if (first_above_time_ == 0) {
++                // just went above from below. if still above at first_above_time,
++                // will say it’s ok to drop
++                first_above_time_ = now + interval_;
++            } else if (now >= first_above_time_) {
++                r.ok_to_drop = 1;
++            }
++        }
++    }
++    return r;
++}
++
++// All of the work of CoDel is done here. There are two branches: In packet
++// dropping state (meaning that the queue sojourn time has gone above target
++// and hasn’t come down yet) check if it’s time to leave or if it’s time for
++// the next drop(s). If not in dropping state, decide if it’s time to enter it
++// and do the initial drop.
++
++Packet* CoDelQueue::deque()
++{
++    double now = Scheduler::instance().clock();;
++    dodequeResult r = dodeque();
++
++    if (dropping_) {
++        if (! r.ok_to_drop) {
++            // sojourn time below target - leave dropping state
++            dropping_ = 0;
++        }
++        // It’s time for the next drop. Drop the current packet and dequeue
++        // the next.  If the dequeue doesn't take us out of dropping state,
++        // schedule the next drop. A large backlog might result in drop
++        // rates so high that the next drop should happen now, hence the
++        // ‘while’ loop.
++        while (now >= drop_next_ && dropping_) {
++            drop(r.p);
++            ++count_;
++            r = dodeque();
++            if (! r.ok_to_drop) {
++                // leave dropping state
++                dropping_ = 0;
++            } else {
++                // schedule the next drop.
++                drop_next_ = control_law(drop_next_);
++            }
++        }
++
++    // If we get here we’re not in dropping state. 'ok_to_drop' means that the
++    // sojourn time has been above target for interval so enter dropping state.
++    } else if (r.ok_to_drop) {
++        drop(r.p);
++        r = dodeque();
++        dropping_ = 1;
++
++        // If min went above target close to when it last went below,
++        // assume that the drop rate that controlled the queue on the
++        // last cycle is a good starting point to control it now.
++        count_ = (count_ > 1 && now - drop_next_ < 16*interval_)? count_ - 1 : 1;
++        drop_next_ = control_law(now);
++    }
++    return (r.p);
++}
++
++int CoDelQueue::command(int argc, const char*const* argv)
++{
++    Tcl& tcl = Tcl::instance();
++    if (argc == 2) {
++        if (strcmp(argv[1], "reset") == 0) {
++            reset();
++            return (TCL_OK);
++        }
++    } else if (argc == 3) {
++        // attach a file for variable tracing
++        if (strcmp(argv[1], "attach") == 0) {
++            int mode;
++            const char* id = argv[2];
++            tchan_ = Tcl_GetChannel(tcl.interp(), (char*)id, &mode);
++            if (tchan_ == 0) {
++                tcl.resultf("CoDel trace: can't attach %s for writing", id);
++                return (TCL_ERROR);
++            }
++            return (TCL_OK);
++        }
++        // connect CoDel to the underlying queue
++        if (!strcmp(argv[1], "packetqueue-attach")) {
++            delete q_;
++            if (!(q_ = (PacketQueue*) TclObject::lookup(argv[2])))
++                return (TCL_ERROR);
++            else {
++                pq_ = q_;
++                return (TCL_OK);
++            }
++        }
++    }
++    return (Queue::command(argc, argv));
++}
++
++// Routine called by TracedVar facility when variables change values.
++// Note that the tracing of each var must be enabled in tcl to work.
++void
++CoDelQueue::trace(TracedVar* v)
++{
++    const char *p;
++
++    if (((p = strstr(v->name(), "curq")) == NULL) &&
++        ((p = strstr(v->name(), "d_exp")) == NULL) ) {
++        fprintf(stderr, "CoDel: unknown trace var %s\n", v->name());
++        return;
++    }
++    if (tchan_) {
++        char wrk[500];
++        double t = Scheduler::instance().clock();
++        if(*p == 'c') {
++            sprintf(wrk, "c %g %d", t, int(*((TracedInt*) v)));
++        } else if(*p == 'd') {
++            sprintf(wrk, "d %g %g %d %g", t, double(*((TracedDouble*) v)), count_,
++                    count_? control_law(0.)*1000.:0.);
++        }
++        int n = strlen(wrk);
++        wrk[n] = '\n'; 
++        wrk[n+1] = 0;
++        (void)Tcl_Write(tchan_, wrk, n+1);
++    }
++}
+diff -ru --unidirectional-new-file ns-allinone-2.35/ns-2.35/queue/codel.h ns-allinone-2.35-patched/ns-2.35/queue/codel.h
+--- ns-allinone-2.35/ns-2.35/queue/codel.h	1969-12-31 16:00:00.000000000 -0800
++++ ns-allinone-2.35-patched/ns-2.35/queue/codel.h	2012-05-13 22:02:27.000000000 -0700
+@@ -0,0 +1,84 @@
++/*
++ * Codel - The Controlled-Delay Active Queue Management algorithm
++ * Copyright (C) 2011-2012 Kathleen Nichols <nichols@pollere.com>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions, and the following disclaimer,
++ *    without modification.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The names of the authors may not be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * Alternatively, provided that this notice is retained in full, this
++ * software may be distributed under the terms of the GNU General
++ * Public License ("GPL") version 2, in which case the provisions of the
++ * GPL apply INSTEAD OF those given above.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef ns_codel_h
++#define ns_codel_h
++
++#include "queue.h"
++#include <stdlib.h>
++#include "agent.h"
++#include "template.h"
++#include "trace.h"
++
++// we need a multi-valued return and C doesn't help
++struct dodequeResult { Packet* p; int ok_to_drop; };
++
++class CoDelQueue : public Queue {
++  public:   
++    CoDelQueue();
++  protected:
++    // Stuff specific to the CoDel algorithm
++    void enque(Packet* pkt);
++    Packet* deque();
++
++    // Static state (user supplied parameters)
++    double target_;         // target queue size (in time, same units as clock)
++    double interval_;       // width of moving time window over which to compute min
++
++    // Dynamic state used by algorithm
++    double first_above_time_; // when we went (or will go) continuously above
++                              // target for interval
++    double drop_next_;      // time to drop next packet (or when we dropped last)
++    int count_;             // how many drops we've done since the last time
++                            // we entered dropping state.
++    int dropping_;          // = 1 if in dropping state.
++    int maxpacket_;         // largest packet we've seen so far (this should be
++                            // the link's MTU but that's not available in NS)
++
++    // NS-specific junk
++    int command(int argc, const char*const* argv);
++    void reset();
++    void trace(TracedVar*); // routine to write trace records
++
++    PacketQueue *q_;        // underlying FIFO queue
++    Tcl_Channel tchan_;     // place to write trace records
++    TracedInt curq_;        // current qlen seen by arrivals
++    TracedDouble d_exp_;    // delay seen by most recently dequeued packet
++
++  private:
++    double control_law(double);
++    dodequeResult dodeque();
++};
++
++#endif
+diff -ru --unidirectional-new-file ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl ns-allinone-2.35-patched/ns-2.35/tcl/lib/ns-default.tcl
+--- ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl	2010-07-03 15:45:45.000000000 -0700
++++ ns-allinone-2.35-patched/ns-2.35/tcl/lib/ns-default.tcl	2012-05-07 07:46:30.000000000 -0700
+@@ -248,6 +248,11 @@
+ Queue/REM set markpkts_ false
+ Queue/REM set qib_ false
+ 
++Queue/CoDel set curq_ 0.0
++Queue/CoDel set d_exp_ 0.0
++Queue/CoDel set interval_ 0.1
++Queue/CoDel set target_ .005
++
+ Queue/GK set ecnlim_ 0.95
+ Queue/GK set mean_pktsize_ 1000
+ Queue/GK set curq_ 0

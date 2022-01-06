@@ -1,0 +1,102 @@
+--- enhanced_simplified_vrq.tcl	2020-08-27 15:38:48.000000000 +0800
++++ enhanced_simplified_vrq_tcpvariant.tcl	2021-01-27 23:06:59.665135735 +0800
+@@ -1,4 +1,8 @@
+-set N 40;
++set NUM_QUEUE 4;
++#set NUM_QUEUE 1;
++set NODES_PER_QUEUE 10;
++set N [expr $NODES_PER_QUEUE*$NUM_QUEUE];
++
+ set B 10000
+ set RTT 0.0001;	# default 0.0001
+ puts "The base RTT between the switch and receiver is $RTT"
+@@ -16,22 +20,32 @@
+ set flowClassifyTime 0.001
+ 
+ #set sourceAlg DC-TCP-Sack
+-set sourceAlg Newreno
++set sourceAlg [lindex $argv 1]
+ set switchAlg SPriQueue
+-Queue/SPriQueue set num_queue_ 4;
++Queue/SPriQueue set num_queue_ $NUM_QUEUE;
+ Queue/SPriQueue set default_weight_ 2;
+ Queue/SPriQueue set rtt_lowerbound_ 0.00005;
+ Queue/SPriQueue set rtt_upperbound_ 0.01;
+-Queue/SPriQueue set weighted_rr_ 0;
+-Queue/SPriQueue set delay_based_dropping_ 1;
+-Queue/SPriQueue set avgbw_wrr_ 1;
++Queue/SPriQueue set weighted_rr_ 1;
++Queue/SPriQueue set delay_based_dropping_ 0;
++Queue/SPriQueue set avgbw_wrr_ 0;
+ Queue/SPriQueue set omag_queuediff_ 1;
+ 
++set num_base_rtt 4;
++set base_rtt(0) 0.00005;
++set base_rtt(1) 0.001;
++set base_rtt(2) 0.01;
++set base_rtt(3) 0.2;
+ 
+-set rtts(0) 0.00005;
+-set rtts(1) 0.001;
+-set rtts(2) 0.01;
+-set rtts(3) 0.2;
++for {set i 0} {$i < $N} {incr i} {
++
++	set rtts($i) [expr $base_rtt([expr $i%$num_base_rtt])];
++}
++#for {set i 0} {$i < $NUM_QUEUE} {incr i} {
++#	for  {set j 0} {$j < $NODES_PER_QUEUE} {incr j} {
++#		set rtts([expr $i*$NODES_PER_QUEUE+$j]) [expr $base_rtt($i) + $base_rtt($i)/2]; 
++#	}
++#}
+ 
+ #set bgRate 0.05Gb
+ set bgRate 1Gb
+@@ -145,8 +159,8 @@
+ 
+ for {set i 0} {$i < $N} {incr i} {
+ 	
+-#	set cur_rtt [expr $rtts($i)/4];
+-	set cur_rtt [expr $rtts([expr $i/10])/4];
++	set cur_rtt [expr $rtts($i)/4];
++#	set cur_rtt [expr $rtts([expr $i/10])/4];
+ 	puts "cur_rtt@node($i):[expr $cur_rtt*4+$RTT]";
+ 	set rtt_node($i) [expr $cur_rtt*4+$RTT];
+ 	$ns duplex-link $s($i) $s_tor $inputLineRate [expr $cur_rtt] DropTail
+@@ -167,14 +181,22 @@
+ 
+ for {set i 0} { [expr $i] < $N } { incr i } {
+ 
+-	if {[string compare $sourceAlg "Newreno"] == 0 || [string compare $sourceAlg "DC-TCP-Newreno"] == 0} {
++	if {[string compare -nocase $sourceAlg "Newreno"] == 0 } {
+ 		set tcp($i) [new Agent/TCP/Newreno]
+ 		set sink($i) [new Agent/TCPSink]
+ 	}
+-	if {[string compare $sourceAlg "Sack"] == 0 || [string compare $sourceAlg "DC-TCP-Sack"] == 0} { 
+-		set tcp($i) [new Agent/TCP/FullTcp/Sack]
+-		set sink($i) [new Agent/TCP/FullTcp/Sack]
+-		$sink($i) listen
++	if {[string compare -nocase $sourceAlg "Cubic"] == 0 } { 
++		set tcp($i) [new Agent/TCP/Linux]
++		set sink($i) [new Agent/TCPSink/Sack1]
++		$sink($i) set ts_echo_rfc1323_ true
++		$ns at 0 "$tcp($i) select_ca cubic"
++	}
++	if {[string compare -nocase $sourceAlg "Vegas"] == 0} {
++		set tcp($i) [new Agent/TCP/Linux]
++		set sink($i) [new Agent/TCPSink/Sack1]
++		$ns at 0 "$tcp($i) select_ca vegas"
++		$sink($i) set ts_echo_rfc1323_ true
++		$tcp($i) set timestamps_ true
+ 	}
+ 
+ 	$ns attach-agent $s($i) $tcp($i)
+@@ -188,7 +210,7 @@
+ 	set ftp($i) [new Application/FTP];
+         $ftp($i) attach-agent $tcp($i);
+ 
+-	$ns at 0 "$ftp($i) start"
++	$ns at 0.0001 "$ftp($i) start"
+ 	$ns at $simulationTime "$ftp($i) stop";
+ }
+ 

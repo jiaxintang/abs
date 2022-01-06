@@ -1,0 +1,14 @@
+---------no tcp connection-------
+real	34m44.276s
+user	34m41.081s
+sys	0m0.109s
+
+---------with short tcp connection------
+real	33m12.413s
+user	33m9.630s
+sys	0m0.160s
+
+-------- disconnect agent --------
+real    23m12.935s
+user    23m10.206s
+sys     0m0.178s

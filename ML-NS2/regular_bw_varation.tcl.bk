@@ -1,0 +1,30 @@
+source regular_bw_varation_pre.tcl
+source bw_red.tcl;
+
+set accelerated_bw 0;
+set stride [expr 500*1000];
+set bw_upperbound [expr 50*1000*1000]; 
+set flag 1;
+set pi [expr 3.1415];
+for {set i 0} {[expr $i*1.0/100] < $simulationTime} {incr i} {
+
+	set cur_time [expr $i*1.0/100];
+
+	if { $flag > 0 } {
+		set accelerated_bw [expr $accelerated_bw + $stride];
+		
+	} else {
+
+		set accelerated_bw [expr $accelerated_bw - $stride];
+	} 
+
+	if { $accelerated_bw >= $bw_upperbound || $accelerated_bw < $stride } {
+	
+		set flag [expr -$flag];
+	}
+	puts "$cur_time:\t[expr $baseline*1000*1000*1000-$accelerated_bw]"
+	$ns at [expr 0+$cur_time] "$cbr change-rate $accelerated_bw]";
+}
+
+$ns at $simulationTime "finish"
+$ns run
